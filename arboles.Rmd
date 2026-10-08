@@ -1,0 +1,578 @@
+---
+title: "Arboles de Espuma"
+author: "Bennett Kohlhepp"
+date: "2025-07-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=T,eval=T,message=F,warning=F,fig.align='center')
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(stringr)
+library(corrplot)
+library(writexl)
+library(readxl)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+load("safont.RData")
+```
+
+## Conjunto de datos (Final Data)
+> Cargar y limpiar datos, formatear fechas 
+> Descargar los datos finales
+
+```{r}
+#Descargar los datos 
+data = read.csv("data_final.csv")
+
+#Quitar el espacio blanco y convertir las fechas al tipo de safont
+data_new_fecha = data %>% mutate(Fecha = str_trim(Fecha), Hora = str_trim(Hora), fecha = dmy_hms(paste(Fecha, Hora)))
+
+#Crear datos completos de copernicus
+comp_copernicus = data_new_fecha %>% filter(Fuente == "Copernicus")
+
+#Combinar el conjunto de datos con safont
+merged_data = left_join(data_new_fecha, safont, by = "fecha")
+
+#Quitar la columna nombre_estacion
+merged_data = merged_data %>% select(-nombre_estacion)
+
+#Quitar las filas que no tienen datos 
+cleaned_na = merged_data %>% filter(!if_all(c(`Temperatura °C`, `pH`, `Conductividad µS/cm`, `Oxígeno mg/l`, `Turbidez NTU`, `Amonio mg/l`, `Fosfatos mg/l`,`Nitratos mg/l`), is.na))
+
+#Convertir los datos al formato safont y quitar los medios
+final_data = cleaned_na %>% select(-Fecha, -Hora) %>% filter(Fuente == "Copernicus")
+
+#Cambiar los datos al formatos más bonitos
+final_data = final_data %>% rename(Fecha = fecha) %>% select(Fecha, Espuma, Alta_espuma,`Temperatura °C`, `pH`, `Conductividad µS/cm`, `Oxígeno mg/l`, `Turbidez NTU`, `Amonio mg/l`, `Fosfatos mg/l`,`Nitratos mg/l`, Fuente)
+
+#Cambiar el conjunto de datos a inglés
+translation_dict = c(
+  "Fecha" = "Date",
+  "Espuma" = "Foam",
+  "Alta_espuma" = "High Foam",
+  "Temperatura °C" = "Temperature °C",
+  "pH" = "pH",
+  "Conductividad µS/cm" = "Conductivity µS/cm",
+  "Oxígeno mg/l" = "Oxygen mg/l",
+  "Turbidez NTU" = "Turbidity NTU",
+  "Amonio mg/l" = "Ammonium mg/l",
+  "Fosfatos mg/l" = "Phosphates mg/l",
+  "Nitratos mg/l" = "Nitrates mg/l",
+  "Fuente" = "Source"
+)
+
+final_data = final_data %>%
+  mutate(
+    Espuma = case_when(
+      Espuma == "Sí" ~ "Yes",
+      Espuma == "No" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    Alta_espuma = case_when(
+      Alta_espuma == "Sí" ~ "Yes",
+      Alta_espuma == "No" ~ "No",
+      TRUE ~ NA_character_
+    )
+  )
+
+final_data = final_data %>%
+  rename_with(~ translation_dict[.x], .cols = names(translation_dict))
+
+translation_dict2 = c(
+  "Fecha" = "Day",
+  "Hora" = "Time",
+  "Espuma" = "Foam",
+  "Alta_espuma" = "High Foam",
+  "Fuente" = "Source",
+  "fecha" = "Date"
+)
+
+comp_copernicus = comp_copernicus %>%
+  mutate(
+    Espuma = case_when(
+      Espuma == "Sí" ~ "Yes",
+      Espuma == "No" ~ "No",
+      TRUE ~ NA_character_
+    ),
+    Alta_espuma = case_when(
+      Alta_espuma == "Sí" ~ "Yes",
+      Alta_espuma == "No" ~ "No",
+      TRUE ~ NA_character_
+    )
+  )
+
+comp_copernicus = comp_copernicus %>%
+  rename_with(~ translation_dict2[.x], .cols = names(translation_dict2))
+
+
+
+
+```
+
+> El conjunto de datos "final_data" contiene todos los datos del satélite Copernicus que coinciden por fecha con los datos de Safont. Incluye 178 observaciones. El merge solo incluye los días que tienen al menos una variable fisicoquímica registrada.
+> El conjunto comp_copernicus incluye todos los datos del satélite Copernicus correspondientes a días con y sin presencia de espuma (Sí y No). Incluye 393 observaciones, 198 Sí espuma, 195 No espuma. 
+
+## Conjunto de datos (Safont)
+> Filtrar datos de Safont desde el año 2016
+
+```{r}
+#Safont de 2016 a 2021
+safont_2016 = safont %>% mutate(Year = year(fecha)) %>% filter(Year >= 2016)
+
+#Cambiar el conjunto de datos a inglés
+translation_dict_safont = c(
+  "nombre_estacion" = "station_name",
+  "fecha" = "Date",
+  "Temperatura °C" = "Temperature °C",
+  "pH" = "pH",
+  "Conductividad µS/cm" = "Conductivity µS/cm",
+  "Oxígeno mg/l" = "Oxygen mg/l",
+  "Turbidez NTU" = "Turbidity NTU",
+  "Amonio mg/l" = "Ammonium mg/l",
+  "Fosfatos mg/l" = "Phosphates mg/l",
+  "Nitratos mg/l" = "Nitrates mg/l"
+)
+
+safont_2016 = safont_2016 %>%
+  rename_with(~ translation_dict_safont[.x], .cols = names(translation_dict_safont))
+  
+```
+
+> El conjunto de datos "safont_2016" incluye todas las observaciones registradas en Safont desde 2016 hasta 2021. Incluye 161.849 observaciones.
+
+
+## Conjuntos de datos (La temperatura mediana)
+> Crear una columna que identifica si la temperatura está por debajo de la mediana (17.3°C).
+
+```{r}
+#Para safont
+median_temp_safont = safont_2016 %>% mutate(Below_median = case_when(`Temperature °C` <= 17.3 ~ "Yes", TRUE ~ "No"))
+safont_fria = median_temp_safont %>% filter(Below_median == "Yes")
+safont_caliente = median_temp_safont %>% filter(Below_median == "No")
+
+#Para data final
+median_temp_final = final_data %>% mutate(Below_median = case_when(`Temperature °C` <= 17.3 ~ "Yes", TRUE ~ "No"))
+final_fria = median_temp_final %>% filter(Below_median == "Yes")
+final_caliente = median_temp_final %>% filter(Below_median == "No")
+```
+
+## Arboles de Clasificación
+
+# Solo Temperatura con precision media
+
+```{r}
+# Define cross-validation
+control_train = trainControl(
+  method = "cv",      # k-fold cross-validation
+  number = 10,         # try 5 or 10 depending on data size
+  savePredictions = "final",
+  classProbs = TRUE
+)
+
+# Recreate numeric modeling dataset
+final_data_numeric = final_data %>%
+  select(Foam, where(is.numeric)) %>%
+  rename_with(make.names) %>% drop_na()
+
+# Ensure Foam is a factor
+final_data_numeric$Foam = as.factor(final_data_numeric$Foam)
+
+
+final_data_tree_temp = final_data %>% filter(!is.na(`Temperature °C`))
+names(final_data_tree_temp) = make.names(names(final_data_tree_temp))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~Temperature..C, data = final_data_tree_temp, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_temp = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_temp
+```
+# Ammonio y Temperatura con precision media
+
+```{r}
+
+final_data_tree_amm = final_data %>% filter(!is.na(`Ammonium mg/l`))
+names(final_data_tree_amm) = make.names(names(final_data_tree_amm))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l, data = final_data_tree_amm, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_amm = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_amm
+```
+
+# Ammonio y Temperatura con precision media
+
+```{r}
+
+final_data_tree_top_2 = final_data %>% filter(!is.na(`Ammonium mg/l`), !is.na(`Temperature °C`))
+names(final_data_tree_top_2) = make.names(names(final_data_tree_top_2))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l + Temperature..C, data = final_data_tree_top_2, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_at = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_at
+```
+
+## Top 5 variables con precision media
+
+```{r}
+
+final_data_tree_top_5 = final_data %>% filter(!is.na(`Ammonium mg/l`), !is.na(`Temperature °C`), !is.na(pH), !is.na(`Conductivity µS/cm`), !is.na(`Oxygen mg/l`))
+
+names(final_data_tree_top_5) = make.names(names(final_data_tree_top_5))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l + Temperature..C + pH + Conductivity.µS.cm + Oxygen.mg.l, data = final_data_tree_top_5, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_top_5 = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_top_5
+```
+
+## Top 4 variables con precision media
+
+```{r}
+
+final_data_tree_top_4 = final_data %>% filter(!is.na(`Ammonium mg/l`), !is.na(`Temperature °C`), !is.na(pH), !is.na(`Oxygen mg/l`))
+
+names(final_data_tree_top_4) = make.names(names(final_data_tree_top_4))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l + Temperature..C + pH + Oxygen.mg.l, data = final_data_tree_top_4, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_top_4 = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_top_4
+```
+
+## Top 3 Variables con precision media
+
+```{r}
+final_data_tree_top_3 = final_data %>% filter(!is.na(`Ammonium mg/l`), !is.na(`Temperature °C`), !is.na(`Oxygen mg/l`))
+
+names(final_data_tree_top_3) = make.names(names(final_data_tree_top_3))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l + Temperature..C + Oxygen.mg.l, data = final_data_tree_top_3, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_top_3 = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_top_3
+```
+
+# Todas las variables con precision media
+
+```{r}
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ ., data = final_data_numeric, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+media_precision = mean(precision) * 100
+accuracy_todos = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_todos
+```
+## Top 4 variables sin temperatura con precision media 
+
+```{r}
+
+final_data_tree_top_4_sin = final_data %>% filter(!is.na(`Ammonium mg/l`), !is.na(pH), !is.na(`Conductivity µS/cm`), !is.na(`Oxygen mg/l`))
+
+names(final_data_tree_top_4_sin) = make.names(names(final_data_tree_top_4_sin))
+
+M = 100
+
+precision = numeric(M)
+
+for (i in 1:M) {
+
+set.seed(123 + i)
+
+tree_model <- train(Foam ~ Ammonium.mg.l + pH + Conductivity.µS.cm + Oxygen.mg.l + Nitrates.mg.l, data = final_data_tree_top_4_sin, method = "rpart", trControl = control_train, control = rpart.control(minsplit = 10))
+
+final = tree_model$finalModel
+
+importancia_arbol <- data.frame(
+  Variable = names(final$variable.importance),
+  Importancia = final$variable.importance
+)
+
+precision[i] = head(tree_model$results %>% arrange(desc(Accuracy)), 1)$Accuracy
+
+}
+
+media_precision = mean(precision) * 100
+accuracy_top_4_sin = data.frame(Average_Accuracy = media_precision)
+
+# ===== GRÁFICO DE IMPORTANCIA DE VARIABLES (ÁRBOL) =====
+p1 <- ggplot(importancia_arbol, aes(x = reorder(Variable, Importancia), y = Importancia)) +
+  geom_col(fill = "steelblue", alpha = 0.7) +
+  geom_text(aes(label = round(Importancia, 2)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Importancia de Variables - Árbol de Decisión",
+       x = "Variables",
+       y = "Importancia",
+       caption = "Basado en la mejora de la pureza en las divisiones") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+print(p1)
+accuracy_top_4_sin
+```
+
+```{r}
+# Define cross-validation
+control_train = trainControl(
+  method = "cv",      # k-fold cross-validation
+  number = 10,         # try 5 or 10 depending on data size
+  savePredictions = "final",
+  classProbs = TRUE
+)
+
+# Train random forest
+rf_model = train(
+  Foam ~ Temperature..C + Ammonium.mg.l + Oxygen.mg.l + pH + Conductivity.µS.cm,
+  data = final_data_tree_top_5,
+  method = "rf",
+  trControl = control_train,
+  tuneLength = 5    # number of mtry values to try
+)
+
+# View results
+rf_model
+```
+
+> Probé distintos árboles de clasificación usando desde las cinco variables más importantes hasta solo dos, además de modelos con solo amonio o solo temperatura. Los mejores resultados, superiores al 70 %, se obtuvieron usando solo temperatura, o bien un conjunto de cuatro variables excluyendo la temperatura. Dado que el amonio y la temperatura están altamente correlacionados, incluir las dos juntas empeora el modelo, como se comprobó al combinarlas. Para solucionar esto, utilicé un bosque aleatorio, logrando mejorar la precisión hasta un 72%.
+
+
